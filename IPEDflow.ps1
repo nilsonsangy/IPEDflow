@@ -223,9 +223,6 @@ function Write-GpuInfo {
 
         Write-Log -Message "GPU detected: $($gpus -join ' | ')"
         Write-Log -Message "Note: IPEDflow/IPED are primarily CPU-based. GPU acceleration depends on external tools/modules and is not enabled by default."
-        if ($Config.Resource.GpuMetricsEnabled) {
-            Write-Log -Message "GPU telemetry enabled: active every $($Config.Resource.GpuMetricsIntervalActiveSeconds)s, idle every $($Config.Resource.GpuMetricsIntervalIdleSeconds)s."
-        }
     }
     catch {
         Write-Log -Message "GPU detection failed: $($_.Exception.Message)" -Level "WARN"
@@ -351,7 +348,7 @@ function Load-Config {
         $detectGpu = Convert-ToBoolean -Value $rawConfig["DETECT_GPU"] -Default $true
     }
 
-    $gpuMetricsEnabled = $true
+    $gpuMetricsEnabled = $false
     if ($rawConfig.ContainsKey("GPU_METRICS_ENABLED")) {
         $gpuMetricsEnabled = Convert-ToBoolean -Value $rawConfig["GPU_METRICS_ENABLED"] -Default $true
     }
