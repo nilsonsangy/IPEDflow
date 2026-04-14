@@ -29,7 +29,7 @@ This strategy minimizes false positives while acquisition is still writing data.
 Single configuration file: `ipedflow.conf` 🔒
 
 - This file is ignored by Git
-- Create it by copying `ipedflow.example.conf`
+- Create it by copying `ipedflow.conf-example`
 
 Supported keys:
 
@@ -41,6 +41,14 @@ IPED_EXECUTABLE_PATH=C:\Tools\IPED\iped.exe
 IPED_DEFAULT_PROFILE=pedo
 IPED_OUTPUT_ROOT=D:\Forensics\IPED_Processing
 IPED_ADDITIONAL_ARGS=
+ENABLE_RESOURCE_LIMITS=true
+MAX_CPU_PERCENT=70
+MAX_MEMORY_PERCENT=70
+PROCESS_PRIORITY_CLASS=BelowNormal
+DETECT_GPU=true
+GPU_METRICS_ENABLED=true
+GPU_METRICS_INTERVAL_ACTIVE_SECONDS=30
+GPU_METRICS_INTERVAL_IDLE_SECONDS=300
 SCAN_INTERVAL_SECONDS=60
 QUIET_PERIOD_SECONDS=600
 STABILITY_CHECKS_REQUIRED=3
@@ -49,6 +57,21 @@ SERIES_FILE_REGEX=^(?<Stem>.+)\.E(?<Segment>\d{2,3})$
 STATE_FILE=ipedflow-state.json
 LOG_FILE=ipedflow.log
 ```
+
+Resource control notes:
+
+- `MAX_CPU_PERCENT` limits CPU usage by applying processor affinity.
+- `MAX_MEMORY_PERCENT` applies a JVM cap hint (`-XX:MaxRAMPercentage`) for Java-based execution.
+- `PROCESS_PRIORITY_CLASS` can be `Idle`, `BelowNormal`, `Normal`, `AboveNormal`, `High`, or `RealTime`.
+- `DETECT_GPU=true` logs detected GPUs at startup.
+- `GPU_METRICS_INTERVAL_ACTIVE_SECONDS=30` logs GPU telemetry every 30s while processing.
+- `GPU_METRICS_INTERVAL_IDLE_SECONDS=300` logs GPU telemetry every 5 min while idle.
+
+GPU notes:
+
+- IPEDflow can detect GPUs (for example RTX cards) and log them.
+- IPED/Java processing is primarily CPU-based by default.
+- GPU acceleration depends on external tools/modules explicitly built for GPU usage.
 
 Atola-style case folders are supported, for example:
 
@@ -72,7 +95,7 @@ D:\Forensics\IPED_Processing\\<MATERIAL>\IPED_processing\processing.log
 1. Copy example settings:
 
 ```powershell
-Copy-Item .\ipedflow.example.conf .\ipedflow.conf
+Copy-Item .\ipedflow.conf-example .\ipedflow.conf
 ```
 
 2. Edit `ipedflow.conf` with your real paths and settings.
@@ -80,7 +103,7 @@ Copy-Item .\ipedflow.example.conf .\ipedflow.conf
 3. Run interactively:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\IPEDflow.ps1
+powershell -ExecutionPolicy Bypass -File .\IPEDflow.ps1
 ```
 
 ## 🧪 Useful run modes
@@ -88,13 +111,35 @@ powershell -ExecutionPolicy Bypass -File .\scripts\IPEDflow.ps1
 Run once (single scan):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\IPEDflow.ps1 -RunOnce
+powershell -ExecutionPolicy Bypass -File .\IPEDflow.ps1 -RunOnce
 ```
 
 Choose profile explicitly:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\IPEDflow.ps1 -IpedProfile pedo
+powershell -ExecutionPolicy Bypass -File .\IPEDflow.ps1 -IpedProfile pedo
+```
+
+## 🖥️ Standalone mode (no Windows service)
+
+You can run IPEDflow directly without installing a service.
+
+Run in foreground:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\IPEDflow.ps1 -IpedProfile pedo
+```
+
+Run one scan and exit:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\IPEDflow.ps1 -RunOnce
+```
+
+Run in background (detached process):
+
+```powershell
+Start-Process -FilePath powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File .\IPEDflow.ps1 -IpedProfile pedo' -WorkingDirectory (Get-Location)
 ```
 
 ## 🧩 Prerequisite
@@ -114,19 +159,19 @@ nssm version
 Run script:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\IPEDflow.ps1
+powershell -ExecutionPolicy Bypass -File .\IPEDflow.ps1
 ```
 
 Install and start service:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Install-IPEDflowService.ps1 -IpedProfile pedo -StartNow
+powershell -ExecutionPolicy Bypass -File .\Install-Service.ps1 -IpedProfile pedo -StartNow
 ```
 
 Uninstall service:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Uninstall-IPEDflowService.ps1
+powershell -ExecutionPolicy Bypass -File .\Uninstall-Service.ps1
 ```
 
 ## 🛠️ Windows service
@@ -134,7 +179,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Uninstall-IPEDflowService.ps1
 Install and start:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Install-IPEDflowService.ps1 -StartNow
+powershell -ExecutionPolicy Bypass -File .\Install-Service.ps1 -StartNow
 ```
 
 If the terminal is not elevated, the installer requests UAC elevation automatically.
@@ -142,25 +187,25 @@ If the terminal is not elevated, the installer requests UAC elevation automatica
 You can pass a custom NSSM path:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Install-IPEDflowService.ps1 -NssmPath "C:\Tools\nssm\win64\nssm.exe" -StartNow
+powershell -ExecutionPolicy Bypass -File .\Install-Service.ps1 -NssmPath "C:\Tools\nssm\win64\nssm.exe" -StartNow
 ```
 
 Install with explicit profile:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Install-IPEDflowService.ps1 -IpedProfile pedo -StartNow
+powershell -ExecutionPolicy Bypass -File .\Install-Service.ps1 -IpedProfile pedo -StartNow
 ```
 
 Uninstall:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Uninstall-IPEDflowService.ps1
+powershell -ExecutionPolicy Bypass -File .\Uninstall-Service.ps1
 ```
 
 You can pass a custom NSSM path:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Uninstall-IPEDflowService.ps1 -NssmPath "C:\Tools\nssm\win64\nssm.exe"
+powershell -ExecutionPolicy Bypass -File .\Uninstall-Service.ps1 -NssmPath "C:\Tools\nssm\win64\nssm.exe"
 ```
 
 ## 🔐 Security notes

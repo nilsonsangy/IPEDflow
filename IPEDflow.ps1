@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) "ipedflow.conf"
+    $ConfigPath = Join-Path $PSScriptRoot "ipedflow.conf"
 }
 
 function Resolve-ConfigPath {
@@ -18,7 +18,7 @@ function Resolve-ConfigPath {
         return $PathValue
     }
 
-    return Join-Path (Split-Path -Parent $PSScriptRoot) $PathValue
+    return Join-Path $PSScriptRoot $PathValue
 }
 
 function Ensure-ParentDirectory {
@@ -48,6 +48,188 @@ function Write-Log {
     $line = "[$timestamp][$Level] $Message"
     Add-Content -LiteralPath $script:LogFile -Value $line
     Write-Host $line
+}
+
+function Convert-ToBoolean {
+    param(
+        [string]$Value,
+        [bool]$Default = $false
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Default
+    }
+
+    switch ($Value.Trim().ToLowerInvariant()) {
+        "1" { return $true }
+        "true" { return $true }
+        "yes" { return $true }
+        "y" { return $true }
+        "on" { return $true }
+        "0" { return $false }
+        "false" { return $false }
+        "no" { return $false }
+        "n" { return $false }
+        "off" { return $false }
+        default { return $Default }
+    }
+}
+
+function Clamp-Int {
+    param(
+        [int]$Value,
+        [int]$Min,
+        [int]$Max
+    )
+
+    if ($Value -lt $Min) { return $Min }
+    if ($Value -gt $Max) { return $Max }
+    return $Value
+}
+
+function Resolve-NvidiaSmiPath {
+    $command = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    $command = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    $defaultPath = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+    if (Test-Path -LiteralPath $defaultPath) {
+        return $defaultPath
+    }
+
+    return $null
+}
+
+function Get-GpuMetricsSnapshot {
+    if (-not $config.Resource.GpuMetricsEnabled) {
+        return @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:NvidiaSmiPath)) {
+        return @()
+    }
+
+    try {
+        $metrics = & $script:NvidiaSmiPath --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>$null
+        if ($null -eq $metrics) {
+            return @()
+        }
+
+        return @($metrics)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Write-GpuMetrics {
+    param([string]$Context)
+
+    if (-not $config.Resource.GpuMetricsEnabled) {
+        return
+    }
+
+    $metrics = Get-GpuMetricsSnapshot
+    if ($metrics.Count -eq 0) {
+        if (-not $script:GpuMetricsUnavailableLogged) {
+            Write-Log -Message "GPU metrics enabled, but nvidia-smi is unavailable or returned no data." -Level "WARN"
+            $script:GpuMetricsUnavailableLogged = $true
+        }
+
+        return
+    }
+
+    foreach ($line in $metrics) {
+        Write-Log -Message "GPU metrics [$Context]: $line"
+    }
+}
+
+function Get-AffinityMask {
+    param([int]$CpuPercent)
+
+    $logicalProcessors = [Environment]::ProcessorCount
+    $targetProcessors = [int][Math]::Floor(($logicalProcessors * $CpuPercent) / 100)
+    $targetProcessors = [Math]::Max(1, $targetProcessors)
+    $targetProcessors = [Math]::Min($logicalProcessors, $targetProcessors)
+
+    if ($targetProcessors -ge $logicalProcessors) {
+        return [IntPtr]::Zero
+    }
+
+    [int64]$mask = 0
+    for ($i = 0; $i -lt $targetProcessors; $i++) {
+        $mask = $mask -bor ([int64]1 -shl $i)
+    }
+
+    return [IntPtr]$mask
+}
+
+function Apply-ProcessResourceLimits {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [pscustomobject]$Config,
+        [string]$Tag
+    )
+
+    if (-not $Config.Resource.EnableLimits) {
+        return
+    }
+
+    try {
+        $priorityName = $Config.Resource.PriorityClass
+        $valid = [System.Enum]::GetNames([System.Diagnostics.ProcessPriorityClass])
+        if ($valid -contains $priorityName) {
+            $Process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::$priorityName
+        }
+        else {
+            $Process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+            $priorityName = "BelowNormal"
+        }
+
+        $affinityMask = Get-AffinityMask -CpuPercent $Config.Resource.MaxCpuPercent
+        if ($affinityMask -ne [IntPtr]::Zero) {
+            $Process.ProcessorAffinity = $affinityMask
+        }
+
+        Write-Log -Message "Resource limits applied to $Tag (PID $($Process.Id)): CPU max ~$($Config.Resource.MaxCpuPercent)% | priority $priorityName"
+    }
+    catch {
+        Write-Log -Message "Could not apply resource limits to $Tag (PID $($Process.Id)): $($_.Exception.Message)" -Level "WARN"
+    }
+}
+
+function Write-GpuInfo {
+    param([pscustomobject]$Config)
+
+    if (-not $Config.Resource.DetectGpu) {
+        return
+    }
+
+    try {
+        $gpus = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.Name)
+        } | Select-Object -ExpandProperty Name
+
+        if ($null -eq $gpus -or $gpus.Count -eq 0) {
+            Write-Log -Message "No GPU detected via Win32_VideoController." -Level "WARN"
+            return
+        }
+
+        Write-Log -Message "GPU detected: $($gpus -join ' | ')"
+        Write-Log -Message "Note: IPEDflow/IPED are primarily CPU-based. GPU acceleration depends on external tools/modules and is not enabled by default."
+        if ($Config.Resource.GpuMetricsEnabled) {
+            Write-Log -Message "GPU telemetry enabled: active every $($Config.Resource.GpuMetricsIntervalActiveSeconds)s, idle every $($Config.Resource.GpuMetricsIntervalIdleSeconds)s."
+        }
+    }
+    catch {
+        Write-Log -Message "GPU detection failed: $($_.Exception.Message)" -Level "WARN"
+    }
 }
 
 function Load-Config {
@@ -144,6 +326,46 @@ function Load-Config {
         $ipedAdditionalArgs = $rawConfig["IPED_ADDITIONAL_ARGS"]
     }
 
+    $enableResourceLimits = $true
+    if ($rawConfig.ContainsKey("ENABLE_RESOURCE_LIMITS")) {
+        $enableResourceLimits = Convert-ToBoolean -Value $rawConfig["ENABLE_RESOURCE_LIMITS"] -Default $true
+    }
+
+    $maxCpuPercent = 70
+    if ($rawConfig.ContainsKey("MAX_CPU_PERCENT")) {
+        $maxCpuPercent = Clamp-Int -Value ([int]$rawConfig["MAX_CPU_PERCENT"]) -Min 1 -Max 100
+    }
+
+    $maxMemoryPercent = 70
+    if ($rawConfig.ContainsKey("MAX_MEMORY_PERCENT")) {
+        $maxMemoryPercent = Clamp-Int -Value ([int]$rawConfig["MAX_MEMORY_PERCENT"]) -Min 1 -Max 100
+    }
+
+    $priorityClass = "BelowNormal"
+    if ($rawConfig.ContainsKey("PROCESS_PRIORITY_CLASS")) {
+        $priorityClass = $rawConfig["PROCESS_PRIORITY_CLASS"]
+    }
+
+    $detectGpu = $true
+    if ($rawConfig.ContainsKey("DETECT_GPU")) {
+        $detectGpu = Convert-ToBoolean -Value $rawConfig["DETECT_GPU"] -Default $true
+    }
+
+    $gpuMetricsEnabled = $true
+    if ($rawConfig.ContainsKey("GPU_METRICS_ENABLED")) {
+        $gpuMetricsEnabled = Convert-ToBoolean -Value $rawConfig["GPU_METRICS_ENABLED"] -Default $true
+    }
+
+    $gpuMetricsIntervalActiveSeconds = 30
+    if ($rawConfig.ContainsKey("GPU_METRICS_INTERVAL_ACTIVE_SECONDS")) {
+        $gpuMetricsIntervalActiveSeconds = Clamp-Int -Value ([int]$rawConfig["GPU_METRICS_INTERVAL_ACTIVE_SECONDS"]) -Min 5 -Max 3600
+    }
+
+    $gpuMetricsIntervalIdleSeconds = 300
+    if ($rawConfig.ContainsKey("GPU_METRICS_INTERVAL_IDLE_SECONDS")) {
+        $gpuMetricsIntervalIdleSeconds = Clamp-Int -Value ([int]$rawConfig["GPU_METRICS_INTERVAL_IDLE_SECONDS"]) -Min 30 -Max 3600
+    }
+
     return [pscustomobject]@{
         MonitorRoots = $monitorRoots
         ScanIntervalSeconds = $scanInterval
@@ -158,6 +380,16 @@ function Load-Config {
             DefaultProfile = $ipedDefaultProfile
             OutputRoot = $ipedOutputRoot
             AdditionalArgs = $ipedAdditionalArgs
+        }
+        Resource = [pscustomobject]@{
+            EnableLimits = $enableResourceLimits
+            MaxCpuPercent = $maxCpuPercent
+            MaxMemoryPercent = $maxMemoryPercent
+            PriorityClass = $priorityClass
+            DetectGpu = $detectGpu
+            GpuMetricsEnabled = $gpuMetricsEnabled
+            GpuMetricsIntervalActiveSeconds = $gpuMetricsIntervalActiveSeconds
+            GpuMetricsIntervalIdleSeconds = $gpuMetricsIntervalIdleSeconds
         }
     }
 }
@@ -331,6 +563,30 @@ function Get-SeriesFingerprint {
     return "$count|$total|$($last.Number)|$($last.Length)"
 }
 
+function Test-IpedOutputAlreadyExists {
+    param(
+        [pscustomobject]$Series,
+        [pscustomobject]$Config
+    )
+
+    $materialRoot = Join-Path $Config.IPED.OutputRoot $Series.CaseName
+    $outputDir = Join-Path $materialRoot "IPED_processing"
+    $logPath = Join-Path $outputDir "processing.log"
+
+    if (Test-Path -LiteralPath $logPath) {
+        return $true
+    }
+
+    if (Test-Path -LiteralPath $outputDir) {
+        $content = Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction SilentlyContinue
+        if ($content.Count -gt 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Invoke-Iped {
     param(
         [pscustomobject]$Series,
@@ -363,8 +619,43 @@ function Invoke-Iped {
     $argsForLog = ($argList | ForEach-Object { '"' + $_ + '"' }) -join " "
     Write-Log -Message "Starting IPED for $($Series.CaseName): $exe $argsForLog"
 
+    $previousJavaOptions = $env:_JAVA_OPTIONS
+    if ($Config.Resource.EnableLimits) {
+        $maxRamOption = "-XX:MaxRAMPercentage=$($Config.Resource.MaxMemoryPercent)"
+        if ([string]::IsNullOrWhiteSpace($previousJavaOptions)) {
+            $env:_JAVA_OPTIONS = $maxRamOption
+        }
+        elseif ($previousJavaOptions -match "MaxRAMPercentage") {
+            $env:_JAVA_OPTIONS = [regex]::Replace($previousJavaOptions, "-XX:MaxRAMPercentage=\S+", $maxRamOption)
+        }
+        else {
+            $env:_JAVA_OPTIONS = "$previousJavaOptions $maxRamOption"
+        }
+
+        Write-Log -Message "Applied JVM memory cap hint: $maxRamOption"
+    }
+
     try {
-        $process = Start-Process -FilePath $exe -ArgumentList $argList -Wait -PassThru -WindowStyle Hidden
+        $process = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -WindowStyle Hidden
+        Apply-ProcessResourceLimits -Process $process -Config $Config -Tag "IPED"
+        Write-GpuMetrics -Context "process-start:$($Series.CaseName)"
+
+        $lastActiveGpuMetricAt = Get-Date
+        while (-not $process.HasExited) {
+            $process.Refresh()
+
+            if ($Config.Resource.GpuMetricsEnabled) {
+                $elapsed = ((Get-Date) - $lastActiveGpuMetricAt).TotalSeconds
+                if ($elapsed -ge $Config.Resource.GpuMetricsIntervalActiveSeconds) {
+                    Write-GpuMetrics -Context "processing:$($Series.CaseName)"
+                    $lastActiveGpuMetricAt = Get-Date
+                }
+            }
+
+            Start-Sleep -Seconds 1
+        }
+
+        Write-GpuMetrics -Context "process-end:$($Series.CaseName)"
         if ($process.ExitCode -eq 0) {
             Write-Log -Message "IPED completed for $($Series.CaseName)"
             return $true
@@ -376,6 +667,9 @@ function Invoke-Iped {
     catch {
         Write-Log -Message "Failed to launch IPED for $($Series.CaseName): $($_.Exception.Message)" -Level "ERROR"
         return $false
+    }
+    finally {
+        $env:_JAVA_OPTIONS = $previousJavaOptions
     }
 }
 
@@ -402,8 +696,21 @@ if (-not (Test-Path -LiteralPath $script:LogFile)) {
 }
 
 $state = Load-State -PathValue $stateFile
+$notifiedProcessed = @{}
+$script:NvidiaSmiPath = Resolve-NvidiaSmiPath
+$script:GpuMetricsUnavailableLogged = $false
+$script:LastIdleGpuMetricsAt = (Get-Date).AddSeconds(-$config.Resource.GpuMetricsIntervalIdleSeconds)
 Write-Log -Message "IPEDflow started. Monitoring roots: $($monitorRoots -join ', ')"
 Write-Log -Message "Active IPED profile: $IpedProfile"
+if ($config.Resource.EnableLimits) {
+    Write-Log -Message "Resource limits enabled: CPU=$($config.Resource.MaxCpuPercent)% | Memory/JVM=$($config.Resource.MaxMemoryPercent)% | Priority=$($config.Resource.PriorityClass)"
+}
+else {
+    Write-Log -Message "Resource limits disabled by configuration."
+}
+
+Apply-ProcessResourceLimits -Process (Get-Process -Id $PID) -Config $config -Tag "IPEDflow"
+Write-GpuInfo -Config $config
 
 while ($true) {
     try {
@@ -426,6 +733,23 @@ while ($true) {
             $fingerprint = Get-SeriesFingerprint -Series $series
 
             if ($state.processed.ContainsKey($seriesKey) -and $state.processed[$seriesKey].Fingerprint -eq $fingerprint) {
+                if (-not $notifiedProcessed.ContainsKey($seriesKey) -or $notifiedProcessed[$seriesKey] -ne $fingerprint) {
+                    Write-Log -Message "Already processed, skipping: $($series.CaseName) [$($series.Type)]"
+                    $notifiedProcessed[$seriesKey] = $fingerprint
+                }
+
+                continue
+            }
+
+            if (Test-IpedOutputAlreadyExists -Series $series -Config $config) {
+                $state.processed[$seriesKey] = @{
+                    Fingerprint = $fingerprint
+                    ProcessedAt = (Get-Date).ToString("o")
+                    Detection = "existing-output"
+                }
+
+                Write-Log -Message "Existing IPED output detected, marking as processed and skipping: $($series.CaseName) [$($series.Type)]"
+                $notifiedProcessed[$seriesKey] = $fingerprint
                 continue
             }
 
@@ -466,6 +790,14 @@ while ($true) {
         }
 
         Save-State -State $state -PathValue $stateFile
+
+        if ($config.Resource.GpuMetricsEnabled) {
+            $idleElapsed = ((Get-Date) - $script:LastIdleGpuMetricsAt).TotalSeconds
+            if ($idleElapsed -ge $config.Resource.GpuMetricsIntervalIdleSeconds) {
+                Write-GpuMetrics -Context "idle"
+                $script:LastIdleGpuMetricsAt = Get-Date
+            }
+        }
     }
     catch {
         Write-Log -Message "Loop error: $($_.Exception.Message)" -Level "ERROR"

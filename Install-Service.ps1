@@ -45,7 +45,7 @@ if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) "ipedflow.conf"
+    $ConfigPath = Join-Path $PSScriptRoot "ipedflow.conf"
 }
 
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
