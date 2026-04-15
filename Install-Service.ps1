@@ -5,7 +5,7 @@ param(
     [string]$Description = "Monitors extraction folders and triggers IPED processing.",
     [string]$ScriptPath,
     [string]$ConfigPath,
-    [string]$IpedProfile = "pedo",
+    [string]$IPEDProfile = "pedo",
     [string]$NssmPath = "nssm",
     [switch]$StartNow
 )
@@ -45,7 +45,7 @@ if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $PSScriptRoot "ipedflow.conf"
+    $ConfigPath = Join-Path $PSScriptRoot "IPEDflow.conf"
 }
 
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -62,7 +62,7 @@ if (-not $isAdmin) {
         "-Description", "`"$Description`"",
         "-ScriptPath", "`"$ScriptPath`"",
         "-ConfigPath", "`"$ConfigPath`"",
-        "-IpedProfile", "`"$IpedProfile`"",
+        "-IPEDProfile", "`"$IPEDProfile`"",
         "-NssmPath", "`"$NssmPath`""
     )
 
@@ -105,7 +105,7 @@ if ($null -ne $existing) {
 
 $resolvedNssmPath = Resolve-NssmExecutable -Candidate $NssmPath
 $psExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$serviceArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -ConfigPath `"$ConfigPath`" -IpedProfile `"$IpedProfile`""
+$serviceArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -ConfigPath `"$ConfigPath`" -IPEDProfile `"$IPEDProfile`""
 
 & $resolvedNssmPath install $ServiceName $psExe $serviceArguments | Out-Null
 & $resolvedNssmPath set $ServiceName DisplayName $DisplayName | Out-Null

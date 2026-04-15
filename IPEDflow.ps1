@@ -1,14 +1,14 @@
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
-    [string]$IpedProfile,
+    [string]$IPEDProfile,
     [switch]$RunOnce
 )
 
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $PSScriptRoot "ipedflow.conf"
+    $ConfigPath = Join-Path $PSScriptRoot "IPEDflow.conf"
 }
 
 function Resolve-ConfigPath {
@@ -50,6 +50,17 @@ function Write-Log {
     Write-Host $line
 }
 
+function Write-StandaloneProgress {
+    param([string]$Message)
+
+    if (-not $script:EnableStandaloneProgressReport) {
+        return
+    }
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "[$timestamp][PROGRESS] $Message"
+}
+
 function Convert-ToBoolean {
     param(
         [string]$Value,
@@ -87,67 +98,32 @@ function Clamp-Int {
     return $Value
 }
 
-function Resolve-NvidiaSmiPath {
-    $command = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
-    if ($null -ne $command) {
-        return $command.Source
-    }
+function Get-IPEDProgressPercentFromLog {
+    param([string]$LogPath)
 
-    $command = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
-    if ($null -ne $command) {
-        return $command.Source
-    }
-
-    $defaultPath = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-    if (Test-Path -LiteralPath $defaultPath) {
-        return $defaultPath
-    }
-
-    return $null
-}
-
-function Get-GpuMetricsSnapshot {
-    if (-not $config.Resource.GpuMetricsEnabled) {
-        return @()
-    }
-
-    if ([string]::IsNullOrWhiteSpace($script:NvidiaSmiPath)) {
-        return @()
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        return $null
     }
 
     try {
-        $metrics = & $script:NvidiaSmiPath --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>$null
-        if ($null -eq $metrics) {
-            return @()
-        }
-
-        return @($metrics)
+        $lines = Get-Content -LiteralPath $LogPath -Tail 500 -ErrorAction Stop
     }
     catch {
-        return @()
-    }
-}
-
-function Write-GpuMetrics {
-    param([string]$Context)
-
-    if (-not $config.Resource.GpuMetricsEnabled) {
-        return
+        return $null
     }
 
-    $metrics = Get-GpuMetricsSnapshot
-    if ($metrics.Count -eq 0) {
-        if (-not $script:GpuMetricsUnavailableLogged) {
-            Write-Log -Message "GPU metrics enabled, but nvidia-smi is unavailable or returned no data." -Level "WARN"
-            $script:GpuMetricsUnavailableLogged = $true
+    $lastPercent = $null
+    foreach ($line in $lines) {
+        $matches = [regex]::Matches($line, "(?<!\d)(?<pct>\d{1,3})\s*%(?!\d)")
+        foreach ($m in $matches) {
+            $value = [int]$m.Groups["pct"].Value
+            if ($value -ge 0 -and $value -le 100) {
+                $lastPercent = $value
+            }
         }
-
-        return
     }
 
-    foreach ($line in $metrics) {
-        Write-Log -Message "GPU metrics [$Context]: $line"
-    }
+    return $lastPercent
 }
 
 function Get-AffinityMask {
@@ -232,38 +208,71 @@ function Write-GpuInfo {
 function Load-Config {
     param([string]$PathValue)
 
-    if (-not (Test-Path -LiteralPath $PathValue)) {
-        throw "Config file not found: $PathValue"
+    $rawConfig = @{
+        MONITOR_ROOT = @(
+            "D:\Acquisitions\Inbox_A",
+            "E:\Acquisitions\Inbox_B",
+            "F:\Acquisitions\Inbox_C"
+        )
+        IPED_EXECUTABLE_PATH = "C:\Tools\IPED\iped.exe"
+        IPED_DEFAULT_PROFILE = "pedo"
+        IPED_OUTPUT_ROOT = "D:\Forensics\IPED_Processing"
+        IPED_ADDITIONAL_ARGS = ""
+        ENABLE_RESOURCE_LIMITS = "true"
+        MAX_CPU_PERCENT = "70"
+        MAX_MEMORY_PERCENT = "70"
+        PROCESS_PRIORITY_CLASS = "BelowNormal"
+        DETECT_GPU = "true"
+        ENABLE_STANDALONE_PROGRESS_REPORT = "true"
+        PROGRESS_REPORT_INTERVAL_MINUTES = "60"
+        SCAN_INTERVAL_SECONDS = "60"
+        QUIET_PERIOD_SECONDS = "600"
+        STABILITY_CHECKS_REQUIRED = "3"
+        MAX_ITEMS_PER_CYCLE = "1"
+        SERIES_FILE_REGEX = "^(?<Stem>.+)\\.E(?<Segment>\\d{2,3})$"
+        STATE_FILE = "IPEDflow-state.json"
+        LOG_FILE = "IPEDflow.log"
     }
 
-    $rawConfig = @{}
-    $rawConfig["MONITOR_ROOT"] = @()
+    $configSource = "defaults"
+    if (Test-Path -LiteralPath $PathValue) {
+        $configSource = "file"
+        $rawConfig["MONITOR_ROOT"] = @()
 
-    $lines = Get-Content -LiteralPath $PathValue
-    foreach ($line in $lines) {
-        $trimmed = $line.Trim()
-        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#")) {
-            continue
+        $lines = Get-Content -LiteralPath $PathValue
+        foreach ($line in $lines) {
+            $trimmed = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#")) {
+                continue
+            }
+
+            if ($trimmed -notmatch "=") {
+                continue
+            }
+
+            $parts = $trimmed -split "=", 2
+            $key = $parts[0].Trim().ToUpperInvariant()
+            $value = $parts[1].Trim()
+
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                continue
+            }
+
+            if ($key -eq "MONITOR_ROOT") {
+                $rawConfig["MONITOR_ROOT"] += $value
+                continue
+            }
+
+            $rawConfig[$key] = $value
         }
 
-        if ($trimmed -notmatch "=") {
-            continue
+        if ($rawConfig["MONITOR_ROOT"].Count -eq 0) {
+            $rawConfig["MONITOR_ROOT"] = @(
+                "D:\Acquisitions\Inbox_A",
+                "E:\Acquisitions\Inbox_B",
+                "F:\Acquisitions\Inbox_C"
+            )
         }
-
-        $parts = $trimmed -split "=", 2
-        $key = $parts[0].Trim().ToUpperInvariant()
-        $value = $parts[1].Trim()
-
-        if ([string]::IsNullOrWhiteSpace($value)) {
-            continue
-        }
-
-        if ($key -eq "MONITOR_ROOT") {
-            $rawConfig["MONITOR_ROOT"] += $value
-            continue
-        }
-
-        $rawConfig[$key] = $value
     }
 
     $monitorRoots = @($rawConfig["MONITOR_ROOT"] | Select-Object -Unique)
@@ -293,34 +302,34 @@ function Load-Config {
         $seriesRegex = $rawConfig["SERIES_FILE_REGEX"]
     }
 
-    $stateFile = "ipedflow-state.json"
+    $stateFile = "IPEDflow-state.json"
     if ($rawConfig.ContainsKey("STATE_FILE")) {
         $stateFile = $rawConfig["STATE_FILE"]
     }
 
-    $logFile = "ipedflow.log"
+    $logFile = "IPEDflow.log"
     if ($rawConfig.ContainsKey("LOG_FILE")) {
         $logFile = $rawConfig["LOG_FILE"]
     }
 
-    $ipedExecutablePath = ""
+    $IPEDExecutablePath = ""
     if ($rawConfig.ContainsKey("IPED_EXECUTABLE_PATH")) {
-        $ipedExecutablePath = $rawConfig["IPED_EXECUTABLE_PATH"]
+        $IPEDExecutablePath = $rawConfig["IPED_EXECUTABLE_PATH"]
     }
 
-    $ipedDefaultProfile = "pedo"
+    $IPEDDefaultProfile = "pedo"
     if ($rawConfig.ContainsKey("IPED_DEFAULT_PROFILE")) {
-        $ipedDefaultProfile = $rawConfig["IPED_DEFAULT_PROFILE"]
+        $IPEDDefaultProfile = $rawConfig["IPED_DEFAULT_PROFILE"]
     }
 
-    $ipedOutputRoot = ""
+    $IPEDOutputRoot = ""
     if ($rawConfig.ContainsKey("IPED_OUTPUT_ROOT")) {
-        $ipedOutputRoot = $rawConfig["IPED_OUTPUT_ROOT"]
+        $IPEDOutputRoot = $rawConfig["IPED_OUTPUT_ROOT"]
     }
 
-    $ipedAdditionalArgs = ""
+    $IPEDAdditionalArgs = ""
     if ($rawConfig.ContainsKey("IPED_ADDITIONAL_ARGS")) {
-        $ipedAdditionalArgs = $rawConfig["IPED_ADDITIONAL_ARGS"]
+        $IPEDAdditionalArgs = $rawConfig["IPED_ADDITIONAL_ARGS"]
     }
 
     $enableResourceLimits = $true
@@ -348,22 +357,18 @@ function Load-Config {
         $detectGpu = Convert-ToBoolean -Value $rawConfig["DETECT_GPU"] -Default $true
     }
 
-    $gpuMetricsEnabled = $false
-    if ($rawConfig.ContainsKey("GPU_METRICS_ENABLED")) {
-        $gpuMetricsEnabled = Convert-ToBoolean -Value $rawConfig["GPU_METRICS_ENABLED"] -Default $true
+    $enableStandaloneProgressReport = $true
+    if ($rawConfig.ContainsKey("ENABLE_STANDALONE_PROGRESS_REPORT")) {
+        $enableStandaloneProgressReport = Convert-ToBoolean -Value $rawConfig["ENABLE_STANDALONE_PROGRESS_REPORT"] -Default $true
     }
 
-    $gpuMetricsIntervalActiveSeconds = 30
-    if ($rawConfig.ContainsKey("GPU_METRICS_INTERVAL_ACTIVE_SECONDS")) {
-        $gpuMetricsIntervalActiveSeconds = Clamp-Int -Value ([int]$rawConfig["GPU_METRICS_INTERVAL_ACTIVE_SECONDS"]) -Min 5 -Max 3600
-    }
-
-    $gpuMetricsIntervalIdleSeconds = 300
-    if ($rawConfig.ContainsKey("GPU_METRICS_INTERVAL_IDLE_SECONDS")) {
-        $gpuMetricsIntervalIdleSeconds = Clamp-Int -Value ([int]$rawConfig["GPU_METRICS_INTERVAL_IDLE_SECONDS"]) -Min 30 -Max 3600
+    $progressReportIntervalMinutes = 60
+    if ($rawConfig.ContainsKey("PROGRESS_REPORT_INTERVAL_MINUTES")) {
+        $progressReportIntervalMinutes = Clamp-Int -Value ([int]$rawConfig["PROGRESS_REPORT_INTERVAL_MINUTES"]) -Min 1 -Max 1440
     }
 
     return [pscustomobject]@{
+        ConfigSource = $configSource
         MonitorRoots = $monitorRoots
         ScanIntervalSeconds = $scanInterval
         QuietPeriodSeconds = $quietPeriod
@@ -373,10 +378,10 @@ function Load-Config {
         StateFile = $stateFile
         LogFile = $logFile
         IPED = [pscustomobject]@{
-            ExecutablePath = $ipedExecutablePath
-            DefaultProfile = $ipedDefaultProfile
-            OutputRoot = $ipedOutputRoot
-            AdditionalArgs = $ipedAdditionalArgs
+            ExecutablePath = $IPEDExecutablePath
+            DefaultProfile = $IPEDDefaultProfile
+            OutputRoot = $IPEDOutputRoot
+            AdditionalArgs = $IPEDAdditionalArgs
         }
         Resource = [pscustomobject]@{
             EnableLimits = $enableResourceLimits
@@ -384,9 +389,10 @@ function Load-Config {
             MaxMemoryPercent = $maxMemoryPercent
             PriorityClass = $priorityClass
             DetectGpu = $detectGpu
-            GpuMetricsEnabled = $gpuMetricsEnabled
-            GpuMetricsIntervalActiveSeconds = $gpuMetricsIntervalActiveSeconds
-            GpuMetricsIntervalIdleSeconds = $gpuMetricsIntervalIdleSeconds
+        }
+        Progress = [pscustomobject]@{
+            EnableStandaloneProgressReport = $enableStandaloneProgressReport
+            ReportIntervalMinutes = $progressReportIntervalMinutes
         }
     }
 }
@@ -395,7 +401,7 @@ function Load-State {
     param([string]$PathValue)
 
     if (-not (Test-Path -LiteralPath $PathValue)) {
-        return @{ processed = @{}; pending = @{} }
+        return @{ processed = @{}; pending = @{}; failed = @{} }
     }
 
     try {
@@ -410,10 +416,14 @@ function Load-State {
             $data["pending"] = @{}
         }
 
+        if (-not $data.ContainsKey("failed")) {
+            $data["failed"] = @{}
+        }
+
         return $data
     }
     catch {
-        return @{ processed = @{}; pending = @{} }
+        return @{ processed = @{}; pending = @{}; failed = @{} }
     }
 }
 
@@ -560,7 +570,25 @@ function Get-SeriesFingerprint {
     return "$count|$total|$($last.Number)|$($last.Length)"
 }
 
-function Test-IpedOutputAlreadyExists {
+function Get-CaseOrderInfo {
+    param([pscustomobject]$Series)
+
+    $year = [int]::MaxValue
+    $number = [int]::MaxValue
+
+    $match = [regex]::Match($Series.CaseName, "(?<number>\d+)[_/-](?<year>\d{4})$")
+    if ($match.Success) {
+        $number = [int]$match.Groups["number"].Value
+        $year = [int]$match.Groups["year"].Value
+    }
+
+    return [pscustomobject]@{
+        Year = $year
+        Number = $number
+    }
+}
+
+function Get-IPEDPaths {
     param(
         [pscustomobject]$Series,
         [pscustomobject]$Config
@@ -569,26 +597,89 @@ function Test-IpedOutputAlreadyExists {
     $materialRoot = Join-Path $Config.IPED.OutputRoot $Series.CaseName
     $outputDir = Join-Path $materialRoot "IPED_processing"
     $logPath = Join-Path $outputDir "processing.log"
+    $completionMarkerPath = Join-Path $outputDir ".IPEDflow-completed.json"
 
-    if (Test-Path -LiteralPath $logPath) {
-        return $true
+    return [pscustomobject]@{
+        MaterialRoot = $materialRoot
+        OutputDir = $outputDir
+        LogPath = $logPath
+        CompletionMarkerPath = $completionMarkerPath
+    }
+}
+
+function Test-IPEDCompleted {
+    param(
+        [pscustomobject]$Series,
+        [pscustomobject]$Config,
+        [string]$Fingerprint
+    )
+
+    $paths = Get-IPEDPaths -Series $Series -Config $Config
+    if (-not (Test-Path -LiteralPath $paths.CompletionMarkerPath)) {
+        return $false
     }
 
-    if (Test-Path -LiteralPath $outputDir) {
-        $content = Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction SilentlyContinue
-        if ($content.Count -gt 0) {
+    try {
+        $marker = Get-Content -LiteralPath $paths.CompletionMarkerPath -Raw | ConvertFrom-Json
+        if ($marker.Fingerprint -eq $Fingerprint -and $marker.Status -eq "completed") {
             return $true
         }
+    }
+    catch {
+        return $false
     }
 
     return $false
 }
 
-function Invoke-Iped {
+function Test-IPEDPartialOutput {
     param(
         [pscustomobject]$Series,
         [pscustomobject]$Config,
+        [string]$Fingerprint
+    )
+
+    if (Test-IPEDCompleted -Series $Series -Config $Config -Fingerprint $Fingerprint) {
+        return $false
+    }
+
+    $paths = Get-IPEDPaths -Series $Series -Config $Config
+    if (-not (Test-Path -LiteralPath $paths.OutputDir)) {
+        return $false
+    }
+
+    $content = Get-ChildItem -LiteralPath $paths.OutputDir -Force -ErrorAction SilentlyContinue
+    return ($content.Count -gt 0)
+}
+
+function Write-IPEDCompletionMarker {
+    param(
+        [pscustomobject]$Series,
+        [pscustomobject]$Config,
+        [string]$Fingerprint,
         [string]$Profile
+    )
+
+    $paths = Get-IPEDPaths -Series $Series -Config $Config
+    Ensure-Directory -PathValue $paths.OutputDir
+
+    $marker = [pscustomobject]@{
+        Status = "completed"
+        Fingerprint = $Fingerprint
+        CaseName = $Series.CaseName
+        Profile = $Profile
+        CompletedAt = (Get-Date).ToString("o")
+    }
+
+    $marker | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $paths.CompletionMarkerPath -Encoding UTF8
+}
+
+function Invoke-IPED {
+    param(
+        [pscustomobject]$Series,
+        [pscustomobject]$Config,
+        [string]$Profile,
+        [bool]$ResumeProcessing
     )
 
     $exe = $Config.IPED.ExecutablePath
@@ -597,17 +688,19 @@ function Invoke-Iped {
         return $false
     }
 
-    $materialRoot = Join-Path $Config.IPED.OutputRoot $Series.CaseName
-    $outputDir = Join-Path $materialRoot "IPED_processing"
-    Ensure-Directory -PathValue $outputDir
-    $logPath = Join-Path $outputDir "processing.log"
+    $paths = Get-IPEDPaths -Series $Series -Config $Config
+    Ensure-Directory -PathValue $paths.OutputDir
 
     $argList = @(
         "-profile", $Profile,
         "-d", $Series.ImagePath,
-        "-o", $outputDir,
-        "-log", $logPath
+        "-o", $paths.OutputDir,
+        "-log", $paths.LogPath
     )
+
+    if ($ResumeProcessing) {
+        $argList += "--continue"
+    }
 
     if ($Config.IPED.PSObject.Properties.Name -contains "AdditionalArgs" -and -not [string]::IsNullOrWhiteSpace($Config.IPED.AdditionalArgs)) {
         $argList += $Config.IPED.AdditionalArgs
@@ -635,24 +728,30 @@ function Invoke-Iped {
     try {
         $process = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -WindowStyle Hidden
         Apply-ProcessResourceLimits -Process $process -Config $Config -Tag "IPED"
-        Write-GpuMetrics -Context "process-start:$($Series.CaseName)"
 
-        $lastActiveGpuMetricAt = Get-Date
+        $reportIntervalSeconds = [int]($Config.Progress.ReportIntervalMinutes * 60)
+        $lastProgressReportAt = Get-Date
+
         while (-not $process.HasExited) {
-            $process.Refresh()
+            if ($script:EnableStandaloneProgressReport) {
+                $elapsed = ((Get-Date) - $lastProgressReportAt).TotalSeconds
+                if ($elapsed -ge $reportIntervalSeconds) {
+                    $pct = Get-IPEDProgressPercentFromLog -LogPath $paths.LogPath
+                    if ($null -ne $pct) {
+                        Write-StandaloneProgress -Message "$($Series.CaseName): $pct% completed"
+                    }
+                    else {
+                        Write-StandaloneProgress -Message "$($Series.CaseName): progress percentage not available yet"
+                    }
 
-            if ($Config.Resource.GpuMetricsEnabled) {
-                $elapsed = ((Get-Date) - $lastActiveGpuMetricAt).TotalSeconds
-                if ($elapsed -ge $Config.Resource.GpuMetricsIntervalActiveSeconds) {
-                    Write-GpuMetrics -Context "processing:$($Series.CaseName)"
-                    $lastActiveGpuMetricAt = Get-Date
+                    $lastProgressReportAt = Get-Date
                 }
             }
 
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 5
+            $process.Refresh()
         }
 
-        Write-GpuMetrics -Context "process-end:$($Series.CaseName)"
         if ($process.ExitCode -eq 0) {
             Write-Log -Message "IPED completed for $($Series.CaseName)"
             return $true
@@ -670,16 +769,102 @@ function Invoke-Iped {
     }
 }
 
+function Select-NextReadySeriesKey {
+    param(
+        [object[]]$ReadyEntries,
+        [int]$TimeoutSeconds = 10
+    )
+
+    if (-not [Environment]::UserInteractive) {
+        return $null
+    }
+
+    if ($null -eq $ReadyEntries -or $ReadyEntries.Count -eq 0) {
+        return $null
+    }
+
+    try {
+        # Accessing Console can fail in non-interactive hosts/services.
+        $null = [Console]::KeyAvailable
+    }
+    catch {
+        return $null
+    }
+
+    Write-Host ""
+    Write-Host "Manual selection window ($TimeoutSeconds seconds): choose the next ready material to process."
+
+    for ($i = 0; $i -lt $ReadyEntries.Count; $i++) {
+        $entry = $ReadyEntries[$i]
+        $mode = if ($entry.InterruptedRank -eq 0) { "resume" } else { "new" }
+        Write-Host ("  [{0}] {1} [{2}] ({3})" -f ($i + 1), $entry.Series.CaseName, $entry.Series.Type, $mode)
+    }
+
+    Write-Host -NoNewline ("Selection [1-{0}] then Enter (or wait for default order): " -f $ReadyEntries.Count)
+
+    $rawInput = ""
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $deadline) {
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+
+            if ($key.Key -eq [ConsoleKey]::Enter) {
+                break
+            }
+
+            if ($key.Key -eq [ConsoleKey]::Backspace) {
+                if ($rawInput.Length -gt 0) {
+                    $rawInput = $rawInput.Substring(0, $rawInput.Length - 1)
+                    Write-Host -NoNewline "`b `b"
+                }
+
+                continue
+            }
+
+            if ($key.KeyChar -match "\d") {
+                $rawInput += $key.KeyChar
+                Write-Host -NoNewline $key.KeyChar
+            }
+        }
+        else {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+
+    Write-Host ""
+
+    if ([string]::IsNullOrWhiteSpace($rawInput)) {
+        Write-Log -Message "No manual selection received within $TimeoutSeconds seconds. Continuing by configured queue order."
+        return $null
+    }
+
+    $selectedIndex = 0
+    if (-not [int]::TryParse($rawInput, [ref]$selectedIndex)) {
+        Write-Log -Message "Invalid manual selection '$rawInput'. Continuing by configured queue order." -Level "WARN"
+        return $null
+    }
+
+    if ($selectedIndex -lt 1 -or $selectedIndex -gt $ReadyEntries.Count) {
+        Write-Log -Message "Manual selection '$selectedIndex' is out of range. Continuing by configured queue order." -Level "WARN"
+        return $null
+    }
+
+    $selected = $ReadyEntries[$selectedIndex - 1]
+    Write-Log -Message "Manual selection received. Prioritizing: $($selected.Series.CaseName) [$($selected.Series.Type)]"
+    return $selected.Series.Key
+}
+
 $configFile = Resolve-ConfigPath -PathValue $ConfigPath
 $config = Load-Config -PathValue $configFile
 $monitorRoots = $config.MonitorRoots
 
 if ($monitorRoots.Count -eq 0) {
-    throw "No monitor roots configured. Check ipedflow.conf."
+    throw "No monitor roots configured. Check IPEDflow.conf."
 }
 
-if ([string]::IsNullOrWhiteSpace($IpedProfile)) {
-    $IpedProfile = $config.IPED.DefaultProfile
+if ([string]::IsNullOrWhiteSpace($IPEDProfile)) {
+    $IPEDProfile = $config.IPED.DefaultProfile
 }
 
 $stateFile = Resolve-ConfigPath -PathValue $config.StateFile
@@ -692,13 +877,24 @@ if (-not (Test-Path -LiteralPath $script:LogFile)) {
     New-Item -Path $script:LogFile -ItemType File -Force | Out-Null
 }
 
+if ($config.ConfigSource -eq "defaults") {
+    Write-Log -Message "Config file '$configFile' not found. Using built-in defaults based on IPEDflow.conf-example." -Level "WARN"
+}
+else {
+    Write-Log -Message "Config loaded from file: $configFile"
+}
+
 $state = Load-State -PathValue $stateFile
 $notifiedProcessed = @{}
-$script:NvidiaSmiPath = Resolve-NvidiaSmiPath
-$script:GpuMetricsUnavailableLogged = $false
-$script:LastIdleGpuMetricsAt = (Get-Date).AddSeconds(-$config.Resource.GpuMetricsIntervalIdleSeconds)
+$script:EnableStandaloneProgressReport = ([Environment]::UserInteractive -and $config.Progress.EnableStandaloneProgressReport)
 Write-Log -Message "IPEDflow started. Monitoring roots: $($monitorRoots -join ', ')"
-Write-Log -Message "Active IPED profile: $IpedProfile"
+Write-Log -Message "Active IPED profile: $IPEDProfile"
+if ($script:EnableStandaloneProgressReport) {
+    Write-Log -Message "Standalone progress report enabled: every $($config.Progress.ReportIntervalMinutes) minute(s)."
+}
+else {
+    Write-Log -Message "Standalone progress report disabled (service/non-interactive session or config disabled)."
+}
 if ($config.Resource.EnableLimits) {
     Write-Log -Message "Resource limits enabled: CPU=$($config.Resource.MaxCpuPercent)% | Memory/JVM=$($config.Resource.MaxMemoryPercent)% | Priority=$($config.Resource.PriorityClass)"
 }
@@ -711,90 +907,177 @@ Write-GpuInfo -Config $config
 
 while ($true) {
     try {
-        $allSeries = Get-ExtractionCandidates -Roots $monitorRoots -Config $config | Sort-Object {
-            if ($_.Segments.Count -gt 0) {
-                return $_.Segments[$_.Segments.Count - 1].LastWriteTime
-            }
-
-            return [datetime]::MaxValue
-        }
-
         $processedThisCycle = 0
 
-        foreach ($series in $allSeries) {
-            if ($processedThisCycle -ge $config.MaxItemsPerCycle) {
+        while ($processedThisCycle -lt $config.MaxItemsPerCycle) {
+            # Re-scan before each next material, so newly-finished extractions enter the queue immediately.
+            $allSeries = Get-ExtractionCandidates -Roots $monitorRoots -Config $config
+
+            $orderedSeries = @()
+            foreach ($candidate in $allSeries) {
+                $fingerprint = Get-SeriesFingerprint -Series $candidate
+                $orderInfo = Get-CaseOrderInfo -Series $candidate
+                $isInterrupted = Test-IPEDPartialOutput -Series $candidate -Config $config -Fingerprint $fingerprint
+
+                $orderedSeries += [pscustomobject]@{
+                    Series = $candidate
+                    Fingerprint = $fingerprint
+                    InterruptedRank = $(if ($isInterrupted) { 0 } else { 1 })
+                    Year = $orderInfo.Year
+                    Number = $orderInfo.Number
+                    CaseName = $candidate.CaseName
+                }
+            }
+
+            $orderedSeries = $orderedSeries | Sort-Object InterruptedRank, Year, Number, CaseName
+            if ($orderedSeries.Count -eq 0) {
                 break
             }
 
-            $seriesKey = $series.Key
-            $fingerprint = Get-SeriesFingerprint -Series $series
+            $selectedSeriesKey = $null
+            if ($processedThisCycle -gt 0 -and [Environment]::UserInteractive) {
+                $readyEntriesForManualSelection = @()
 
-            if ($state.processed.ContainsKey($seriesKey) -and $state.processed[$seriesKey].Fingerprint -eq $fingerprint) {
-                if (-not $notifiedProcessed.ContainsKey($seriesKey) -or $notifiedProcessed[$seriesKey] -ne $fingerprint) {
-                    Write-Log -Message "Already processed, skipping: $($series.CaseName) [$($series.Type)]"
+                foreach ($entry in $orderedSeries) {
+                    $series = $entry.Series
+                    $seriesKey = $series.Key
+                    $fingerprint = $entry.Fingerprint
+
+                    if ($state.processed.ContainsKey($seriesKey) -and $state.processed[$seriesKey].Fingerprint -eq $fingerprint) {
+                        continue
+                    }
+
+                    if (Test-IPEDCompleted -Series $series -Config $config -Fingerprint $fingerprint) {
+                        continue
+                    }
+
+                    if (-not (Test-SeriesReady -Series $series -Config $config)) {
+                        continue
+                    }
+
+                    $nextStableCount = 1
+                    if ($state.pending.ContainsKey($seriesKey) -and $state.pending[$seriesKey].Fingerprint -eq $fingerprint) {
+                        $nextStableCount = [int]$state.pending[$seriesKey].StableCount + 1
+                    }
+
+                    if ($nextStableCount -ge $config.StabilityChecksRequired) {
+                        $readyEntriesForManualSelection += $entry
+                    }
+                }
+
+                $selectedSeriesKey = Select-NextReadySeriesKey -ReadyEntries $readyEntriesForManualSelection -TimeoutSeconds 10
+
+                if (-not [string]::IsNullOrWhiteSpace($selectedSeriesKey)) {
+                    $selectedEntry = $orderedSeries | Where-Object { $_.Series.Key -eq $selectedSeriesKey } | Select-Object -First 1
+                    if ($null -ne $selectedEntry) {
+                        $remainingEntries = $orderedSeries | Where-Object { $_.Series.Key -ne $selectedSeriesKey }
+                        $orderedSeries = @($selectedEntry) + @($remainingEntries)
+                    }
+                }
+            }
+
+            $processedOneInPass = $false
+
+            foreach ($entry in $orderedSeries) {
+                if ($processedThisCycle -ge $config.MaxItemsPerCycle) {
+                    break
+                }
+
+                $series = $entry.Series
+                $seriesKey = $series.Key
+                $fingerprint = $entry.Fingerprint
+
+                $resumeProcessing = $false
+
+                if ($state.processed.ContainsKey($seriesKey) -and $state.processed[$seriesKey].Fingerprint -eq $fingerprint) {
+                    if (-not $notifiedProcessed.ContainsKey($seriesKey) -or $notifiedProcessed[$seriesKey] -ne $fingerprint) {
+                        Write-Log -Message "Already processed, skipping: $($series.CaseName) [$($series.Type)]"
+                        $notifiedProcessed[$seriesKey] = $fingerprint
+                    }
+
+                    continue
+                }
+
+                if (Test-IPEDCompleted -Series $series -Config $config -Fingerprint $fingerprint) {
+                    $state.processed[$seriesKey] = @{
+                        Fingerprint = $fingerprint
+                        ProcessedAt = (Get-Date).ToString("o")
+                        Detection = "completion-marker"
+                    }
+
+                    Write-Log -Message "Completed marker found, marking as processed and skipping: $($series.CaseName) [$($series.Type)]"
                     $notifiedProcessed[$seriesKey] = $fingerprint
+                    continue
                 }
 
-                continue
-            }
+                if ($entry.InterruptedRank -eq 0) {
+                    Write-Log -Message "Partial IPED output detected. Will attempt resume with --continue: $($series.CaseName) [$($series.Type)]" -Level "WARN"
+                    $resumeProcessing = $true
+                }
 
-            if (Test-IpedOutputAlreadyExists -Series $series -Config $config) {
-                $state.processed[$seriesKey] = @{
+                if (-not (Test-SeriesReady -Series $series -Config $config)) {
+                    $state.pending.Remove($seriesKey) | Out-Null
+                    continue
+                }
+
+                if ($state.pending.ContainsKey($seriesKey) -and $state.pending[$seriesKey].Fingerprint -eq $fingerprint) {
+                    $stableCount = [int]$state.pending[$seriesKey].StableCount + 1
+                }
+                else {
+                    $stableCount = 1
+                }
+
+                $state.pending[$seriesKey] = @{
                     Fingerprint = $fingerprint
-                    ProcessedAt = (Get-Date).ToString("o")
-                    Detection = "existing-output"
+                    StableCount = $stableCount
+                    LastSeen = (Get-Date).ToString("o")
                 }
 
-                Write-Log -Message "Existing IPED output detected, marking as processed and skipping: $($series.CaseName) [$($series.Type)]"
-                $notifiedProcessed[$seriesKey] = $fingerprint
-                continue
-            }
+                Write-Log -Message "Candidate ready: $($series.CaseName) [$($series.Type)] (stable check $stableCount/$($config.StabilityChecksRequired))"
 
-            if (-not (Test-SeriesReady -Series $series -Config $config)) {
-                $state.pending.Remove($seriesKey) | Out-Null
-                continue
-            }
-
-            if ($state.pending.ContainsKey($seriesKey) -and $state.pending[$seriesKey].Fingerprint -eq $fingerprint) {
-                $stableCount = [int]$state.pending[$seriesKey].StableCount + 1
-            }
-            else {
-                $stableCount = 1
-            }
-
-            $state.pending[$seriesKey] = @{
-                Fingerprint = $fingerprint
-                StableCount = $stableCount
-                LastSeen = (Get-Date).ToString("o")
-            }
-
-            Write-Log -Message "Candidate ready: $($series.CaseName) [$($series.Type)] (stable check $stableCount/$($config.StabilityChecksRequired))"
-
-            if ($stableCount -lt $config.StabilityChecksRequired) {
-                continue
-            }
-
-            $ok = Invoke-Iped -Series $series -Config $config -Profile $IpedProfile
-            if ($ok) {
-                $state.processed[$seriesKey] = @{
-                    Fingerprint = $fingerprint
-                    ProcessedAt = (Get-Date).ToString("o")
+                if ($stableCount -lt $config.StabilityChecksRequired) {
+                    continue
                 }
 
-                $state.pending.Remove($seriesKey) | Out-Null
-                $processedThisCycle += 1
+                $ok = Invoke-IPED -Series $series -Config $config -Profile $IPEDProfile -ResumeProcessing $resumeProcessing
+                if ($ok) {
+                    $state.processed[$seriesKey] = @{
+                        Fingerprint = $fingerprint
+                        ProcessedAt = (Get-Date).ToString("o")
+                    }
+
+                    Write-IPEDCompletionMarker -Series $series -Config $config -Fingerprint $fingerprint -Profile $IPEDProfile
+
+                    $state.pending.Remove($seriesKey) | Out-Null
+                    $state.failed.Remove($seriesKey) | Out-Null
+                    $processedThisCycle += 1
+                    $processedOneInPass = $true
+
+                    # Re-scan immediately before selecting/processing the next material.
+                    break
+                }
+                else {
+                    $failCount = 1
+                    if ($state.failed.ContainsKey($seriesKey)) {
+                        $failCount = [int]$state.failed[$seriesKey].Count + 1
+                    }
+
+                    $state.failed[$seriesKey] = @{
+                        Count = $failCount
+                        LastFailureAt = (Get-Date).ToString("o")
+                        LastFingerprint = $fingerprint
+                    }
+
+                    Write-Log -Message "Case failed/interrupted and will be retried in next cycles: $($series.CaseName) [$($series.Type)] (attempt $failCount)" -Level "WARN"
+                }
+            }
+
+            if (-not $processedOneInPass) {
+                break
             }
         }
 
         Save-State -State $state -PathValue $stateFile
-
-        if ($config.Resource.GpuMetricsEnabled) {
-            $idleElapsed = ((Get-Date) - $script:LastIdleGpuMetricsAt).TotalSeconds
-            if ($idleElapsed -ge $config.Resource.GpuMetricsIntervalIdleSeconds) {
-                Write-GpuMetrics -Context "idle"
-                $script:LastIdleGpuMetricsAt = Get-Date
-            }
-        }
     }
     catch {
         Write-Log -Message "Loop error: $($_.Exception.Message)" -Level "ERROR"

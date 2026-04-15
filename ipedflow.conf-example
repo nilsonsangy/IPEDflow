@@ -1,27 +1,35 @@
-# Copy this file to ipedflow.conf and adjust values.
+# Copy this file to IPEDflow.conf and adjust values.
 # You can repeat MONITOR_ROOT as many times as needed.
 
+# Monitored extraction roots (repeat MONITOR_ROOT for each source location).
 MONITOR_ROOT=D:\Acquisitions\Inbox_A
 MONITOR_ROOT=E:\Acquisitions\Inbox_B
 MONITOR_ROOT=F:\Acquisitions\Inbox_C
 
+# IPED execution settings and output behavior.
 IPED_EXECUTABLE_PATH=C:\Tools\IPED\iped.exe
 IPED_DEFAULT_PROFILE=pedo
 IPED_OUTPUT_ROOT=D:\Forensics\IPED_Processing
 IPED_ADDITIONAL_ARGS=
+
+# Resource controls applied to IPEDflow/IPED processes.
 ENABLE_RESOURCE_LIMITS=true
 MAX_CPU_PERCENT=70
 MAX_MEMORY_PERCENT=70
 PROCESS_PRIORITY_CLASS=BelowNormal
 DETECT_GPU=true
-GPU_METRICS_ENABLED=false
-GPU_METRICS_INTERVAL_ACTIVE_SECONDS=30
-GPU_METRICS_INTERVAL_IDLE_SECONDS=300
 
+# Standalone console progress reporting cadence.
+ENABLE_STANDALONE_PROGRESS_REPORT=true
+PROGRESS_REPORT_INTERVAL_MINUTES=60
+
+# Monitoring loop cadence and stability detection thresholds.
 SCAN_INTERVAL_SECONDS=60
 QUIET_PERIOD_SECONDS=600
 STABILITY_CHECKS_REQUIRED=3
 MAX_ITEMS_PER_CYCLE=1
 SERIES_FILE_REGEX=^(?<Stem>.+)\.E(?<Segment>\d{2,3})$
-STATE_FILE=ipedflow-state.json
-LOG_FILE=ipedflow.log
+
+# Runtime persistence and logging files.
+STATE_FILE=IPEDflow-state.json
+LOG_FILE=IPEDflow.log
