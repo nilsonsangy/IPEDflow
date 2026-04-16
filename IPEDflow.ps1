@@ -802,10 +802,15 @@ function Select-NextReadySeriesKey {
 
     Write-Host -NoNewline ("Selection [1-{0}] then Enter (or wait for default order): " -f $ReadyEntries.Count)
 
+
     $rawInput = ""
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $userStartedTyping = $false
 
-    while ((Get-Date) -lt $deadline) {
+    while ($true) {
+        if (-not $userStartedTyping -and (Get-Date) -ge $deadline) {
+            break
+        }
         if ([Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)
 
@@ -818,16 +823,15 @@ function Select-NextReadySeriesKey {
                     $rawInput = $rawInput.Substring(0, $rawInput.Length - 1)
                     Write-Host -NoNewline "`b `b"
                 }
-
                 continue
             }
 
             if ($key.KeyChar -match "\d") {
                 $rawInput += $key.KeyChar
                 Write-Host -NoNewline $key.KeyChar
+                $userStartedTyping = $true
             }
-        }
-        else {
+        } else {
             Start-Sleep -Milliseconds 100
         }
     }
@@ -908,6 +912,47 @@ Write-GpuInfo -Config $config
 while ($true) {
     try {
         $processedThisCycle = 0
+        # Atualiza status HTML a cada ciclo
+        try {
+            $statusHtmlPath = Join-Path $PSScriptRoot "IPEDflow-status.html"
+            . "$PSScriptRoot\Write-StatusHtml.ps1"
+            Write-StatusHtml -State $state -PathValue $statusHtmlPath -Config $config
+        } catch { Write-Log -Message "Falha ao atualizar status HTML: $($_.Exception.Message)" -Level "WARN" }
+
+        # --- Auditoria de recursos do sistema a cada 30 minutos ---
+        if (-not $script:LastResourceAudit) {
+            $script:LastResourceAudit = Get-Date
+        }
+        $now = Get-Date
+        $minutesSinceAudit = ($now - $script:LastResourceAudit).TotalMinutes
+        if ($minutesSinceAudit -ge 30) {
+            # Memória
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem
+            $totalMem = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+            $freeMem = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+            $usedMem = [math]::Round($totalMem - $freeMem, 2)
+            $memPct = [math]::Round(100 * $usedMem / $totalMem, 1)
+
+            # CPU
+            $cpuLoad = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+            $cpuLoad = [math]::Round($cpuLoad, 1)
+
+            # Disco do sistema
+            $sysDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -eq ($os.SystemDrive + '\') })
+            if ($null -eq $sysDrive) { $sysDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -eq 'C' }) }
+            if ($null -ne $sysDrive) {
+                $diskTotal = [math]::Round($sysDrive.Used + $sysDrive.Free / 1GB, 2)
+                $diskFree = [math]::Round($sysDrive.Free / 1GB, 2)
+                $diskUsed = [math]::Round($sysDrive.Used / 1GB, 2)
+                $diskPct = if ($diskTotal -gt 0) { [math]::Round(100 * $diskUsed / $diskTotal, 1) } else { 0 }
+            } else {
+                $diskTotal = $diskFree = $diskUsed = $diskPct = 'N/A'
+            }
+
+            $msg = "[AUDIT] RAM: $usedMem/$totalMem GB ($memPct%) | CPU: $cpuLoad% | Disk: $diskUsed/$diskTotal GB ($diskPct% used, $diskFree GB free)"
+            Write-Log -Message $msg
+            $script:LastResourceAudit = $now
+        }
 
         while ($processedThisCycle -lt $config.MaxItemsPerCycle) {
             # Re-scan before each next material, so newly-finished extractions enter the queue immediately.
@@ -935,7 +980,7 @@ while ($true) {
             }
 
             $selectedSeriesKey = $null
-            if ($processedThisCycle -gt 0 -and [Environment]::UserInteractive) {
+            if ($orderedSeries.Count -gt 1 -and [Environment]::UserInteractive) {
                 $readyEntriesForManualSelection = @()
 
                 foreach ($entry in $orderedSeries) {
