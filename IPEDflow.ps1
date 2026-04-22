@@ -914,7 +914,7 @@ while ($true) {
         $processedThisCycle = 0
         # Atualiza status HTML a cada ciclo
         try {
-            $statusHtmlPath = Join-Path $PSScriptRoot "IPEDflow-status.html"
+            $statusHtmlPath = Join-Path $PSScriptRoot "IPEDflow_report.html"
             . "$PSScriptRoot\Write-StatusHtml.ps1"
             Write-StatusHtml -State $state -PathValue $statusHtmlPath -Config $config
         } catch { Write-Log -Message "Falha ao atualizar status HTML: $($_.Exception.Message)" -Level "WARN" }
