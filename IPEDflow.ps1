@@ -2,10 +2,28 @@
 param(
     [string]$ConfigPath,
     [string]$IPEDProfile,
-    [switch]$RunOnce
+    [switch]$RunOnce,
+    [switch]$InstallService,
+    [switch]$UninstallService,
+    [string]$ServiceName = "IPEDflow"
 )
 
 $ErrorActionPreference = "Stop"
+
+# --- Service Management ---
+if ($InstallService) {
+    Write-Host "Installing service '$ServiceName'..."
+    $scriptPath = Join-Path $PSScriptRoot "scripts\Install-Service.ps1"
+    & $scriptPath -ServiceName $ServiceName -ScriptPath (Join-Path $PSScriptRoot "IPEDflow.ps1") @PSBoundParameters
+    exit $LASTEXITCODE
+}
+
+if ($UninstallService) {
+    Write-Host "Uninstalling service '$ServiceName'..."
+    $scriptPath = Join-Path $PSScriptRoot "scripts\Uninstall-Service.ps1"
+    & $scriptPath -ServiceName $ServiceName @PSBoundParameters
+    exit $LASTEXITCODE
+}
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $PSScriptRoot "IPEDflow.conf"
@@ -914,9 +932,9 @@ while ($true) {
         $processedThisCycle = 0
         # Atualiza status HTML a cada ciclo
         try {
-            $statusHtmlPath = Join-Path $PSScriptRoot "IPEDflow_report.html"
-            . "$PSScriptRoot\Write-StatusHtml.ps1"
-            Write-StatusHtml -State $state -PathValue $statusHtmlPath -Config $config
+            $statusHtmlPath = Join-Path $PSScriptRoot "IPEDflow-report.html"
+            . "$PSScriptRoot\scripts\Generate-Report.ps1"
+            Generate-Report -State $state -PathValue $statusHtmlPath -Config $config
         } catch { Write-Log -Message "Falha ao atualizar status HTML: $($_.Exception.Message)" -Level "WARN" }
 
         # --- Auditoria de recursos do sistema a cada 30 minutos ---
@@ -1084,12 +1102,20 @@ while ($true) {
                     continue
                 }
 
+                if (-not $state.pending[$seriesKey].ContainsKey("StartedAt")) {
+                    $state.pending[$seriesKey].StartedAt = (Get-Date).ToString("o")
+                }
+
                 $ok = Invoke-IPED -Series $series -Config $config -Profile $IPEDProfile -ResumeProcessing $resumeProcessing
                 if ($ok) {
-                    $state.processed[$seriesKey] = @{
+                    $processedEntry = @{
                         Fingerprint = $fingerprint
                         ProcessedAt = (Get-Date).ToString("o")
                     }
+                    if ($state.pending.ContainsKey($seriesKey) -and $state.pending[$seriesKey].ContainsKey("StartedAt")) {
+                        $processedEntry.StartedAt = $state.pending[$seriesKey].StartedAt
+                    }
+                    $state.processed[$seriesKey] = $processedEntry
 
                     Write-IPEDCompletionMarker -Series $series -Config $config -Fingerprint $fingerprint -Profile $IPEDProfile
 

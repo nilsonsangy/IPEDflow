@@ -1,4 +1,4 @@
-function Write-StatusHtml {
+function Generate-Report {
     param(
         [hashtable]$State,
         [string]$PathValue,
