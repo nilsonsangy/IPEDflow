@@ -758,9 +758,6 @@ function Invoke-IPED {
                     if ($null -ne $pct) {
                         Write-StandaloneProgress -Message "$($Series.CaseName): $pct% completed"
                     }
-                    else {
-                        Write-StandaloneProgress -Message "$($Series.CaseName): progress percentage not available yet"
-                    }
 
                     $lastProgressReportAt = Get-Date
                 }
