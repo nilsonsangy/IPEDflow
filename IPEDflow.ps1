@@ -116,6 +116,126 @@ function Clamp-Int {
     return $Value
 }
 
+if (-not ("IPEDflowNative" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class IPEDflowNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_COUNTERS
+    {
+        public UInt64 ReadOperationCount;
+        public UInt64 WriteOperationCount;
+        public UInt64 OtherOperationCount;
+        public UInt64 ReadTransferCount;
+        public UInt64 WriteTransferCount;
+        public UInt64 OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public Int64 PerProcessUserTimeLimit;
+        public Int64 PerJobUserTimeLimit;
+        public UInt32 LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public UInt32 ActiveProcessLimit;
+        public IntPtr Affinity;
+        public UInt32 PriorityClass;
+        public UInt32 SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    public const int JobObjectExtendedLimitInformation = 9;
+    public const UInt32 JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100;
+    public const UInt32 JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+"@
+}
+
+function Get-TotalPhysicalMemoryBytes {
+    try {
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($null -ne $computerSystem.TotalPhysicalMemory) {
+            return [uint64]$computerSystem.TotalPhysicalMemory
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Set-ProcessMemoryLimit {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [pscustomobject]$Config,
+        [string]$Tag
+    )
+
+    $totalPhysicalMemoryBytes = Get-TotalPhysicalMemoryBytes
+    if ($null -eq $totalPhysicalMemoryBytes -or $totalPhysicalMemoryBytes -le 0) {
+        Write-Log -Message "Could not determine total physical memory; skipping hard memory cap for $Tag." -Level "WARN"
+        return [IntPtr]::Zero
+    }
+
+    $maxMemoryBytes = [uint64][math]::Floor($totalPhysicalMemoryBytes * $Config.Resource.MaxMemoryPercent / 100)
+    $jobHandle = [IPEDflowNative]::CreateJobObject([IntPtr]::Zero, $null)
+    if ($jobHandle -eq [IntPtr]::Zero) {
+        throw "CreateJobObject failed with error code $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+    }
+
+    try {
+        $jobInfo = New-Object IPEDflowNative+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        $jobInfo.BasicLimitInformation.LimitFlags = [IPEDflowNative]::JOB_OBJECT_LIMIT_PROCESS_MEMORY -bor [IPEDflowNative]::JOB_OBJECT_LIMIT_JOB_MEMORY
+        $jobInfo.ProcessMemoryLimit = [UIntPtr]$maxMemoryBytes
+        $jobInfo.JobMemoryLimit = [UIntPtr]$maxMemoryBytes
+
+        $jobInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([IPEDflowNative+JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
+        if (-not [IPEDflowNative]::SetInformationJobObject($jobHandle, [IPEDflowNative]::JobObjectExtendedLimitInformation, [ref]$jobInfo, $jobInfoSize)) {
+            throw "SetInformationJobObject failed with error code $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+        }
+
+        if (-not [IPEDflowNative]::AssignProcessToJobObject($jobHandle, $Process.Handle)) {
+            throw "AssignProcessToJobObject failed with error code $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+        }
+    }
+    catch {
+        [IPEDflowNative]::CloseHandle($jobHandle) | Out-Null
+        throw
+    }
+
+    Write-Log -Message "Hard memory cap applied to $Tag (PID $($Process.Id)): $($Config.Resource.MaxMemoryPercent)% of physical RAM (~$([math]::Round($maxMemoryBytes / 1GB, 2)) GB)"
+    return $jobHandle
+}
+
 function Get-IPEDProgressPercentFromLog {
     param([string]$LogPath)
 
@@ -164,6 +284,14 @@ function Get-AffinityMask {
     return [IntPtr]$mask
 }
 
+function Get-TargetProcessorCount {
+    param([int]$CpuPercent)
+
+    $logicalProcessors = [Environment]::ProcessorCount
+    $targetProcessors = [int][Math]::Floor(($logicalProcessors * $CpuPercent) / 100)
+    return [Math]::Max(1, [Math]::Min($logicalProcessors, $targetProcessors))
+}
+
 function Apply-ProcessResourceLimits {
     param(
         [System.Diagnostics.Process]$Process,
@@ -172,8 +300,10 @@ function Apply-ProcessResourceLimits {
     )
 
     if (-not $Config.Resource.EnableLimits) {
-        return
+        return [IntPtr]::Zero
     }
+
+    $jobHandle = [IntPtr]::Zero
 
     try {
         $priorityName = $Config.Resource.PriorityClass
@@ -186,16 +316,21 @@ function Apply-ProcessResourceLimits {
             $priorityName = "BelowNormal"
         }
 
+        $targetProcessors = Get-TargetProcessorCount -CpuPercent $Config.Resource.MaxCpuPercent
         $affinityMask = Get-AffinityMask -CpuPercent $Config.Resource.MaxCpuPercent
         if ($affinityMask -ne [IntPtr]::Zero) {
             $Process.ProcessorAffinity = $affinityMask
         }
 
-        Write-Log -Message "Resource limits applied to $Tag (PID $($Process.Id)): CPU max ~$($Config.Resource.MaxCpuPercent)% | priority $priorityName"
+        Write-Log -Message "Resource limits applied to $Tag (PID $($Process.Id)): CPU max ~$($Config.Resource.MaxCpuPercent)% -> $targetProcessors processor(s) visible | priority $priorityName"
+
+        $jobHandle = Set-ProcessMemoryLimit -Process $Process -Config $Config -Tag $Tag
     }
     catch {
         Write-Log -Message "Could not apply resource limits to $Tag (PID $($Process.Id)): $($_.Exception.Message)" -Level "WARN"
     }
+
+    return $jobHandle
 }
 
 function Write-GpuInfo {
@@ -216,6 +351,7 @@ function Write-GpuInfo {
         }
 
         Write-Log -Message "GPU detected: $($gpus -join ' | ')"
+        Write-Log -Message "GPU policy target: $($Config.Resource.MaxGpuPercent)% (this release does not enforce a generic hard GPU cap)."
         Write-Log -Message "Note: IPEDflow/IPED are primarily CPU-based. GPU acceleration depends on external tools/modules and is not enabled by default."
     }
     catch {
@@ -239,6 +375,7 @@ function Load-Config {
         ENABLE_RESOURCE_LIMITS = "true"
         MAX_CPU_PERCENT = "70"
         MAX_MEMORY_PERCENT = "70"
+        MAX_GPU_PERCENT = "80"
         PROCESS_PRIORITY_CLASS = "BelowNormal"
         DETECT_GPU = "true"
         ENABLE_STANDALONE_PROGRESS_REPORT = "true"
@@ -365,6 +502,11 @@ function Load-Config {
         $maxMemoryPercent = Clamp-Int -Value ([int]$rawConfig["MAX_MEMORY_PERCENT"]) -Min 1 -Max 100
     }
 
+    $maxGpuPercent = 80
+    if ($rawConfig.ContainsKey("MAX_GPU_PERCENT")) {
+        $maxGpuPercent = Clamp-Int -Value ([int]$rawConfig["MAX_GPU_PERCENT"]) -Min 1 -Max 100
+    }
+
     $priorityClass = "BelowNormal"
     if ($rawConfig.ContainsKey("PROCESS_PRIORITY_CLASS")) {
         $priorityClass = $rawConfig["PROCESS_PRIORITY_CLASS"]
@@ -405,6 +547,7 @@ function Load-Config {
             EnableLimits = $enableResourceLimits
             MaxCpuPercent = $maxCpuPercent
             MaxMemoryPercent = $maxMemoryPercent
+            MaxGpuPercent = $maxGpuPercent
             PriorityClass = $priorityClass
             DetectGpu = $detectGpu
         }
@@ -728,24 +871,41 @@ function Invoke-IPED {
     Write-Log -Message "Starting IPED for $($Series.CaseName): $exe $argsForLog"
 
     $previousJavaOptions = $env:_JAVA_OPTIONS
+    $jobHandle = [IntPtr]::Zero
     if ($Config.Resource.EnableLimits) {
-        $maxRamOption = "-XX:MaxRAMPercentage=$($Config.Resource.MaxMemoryPercent)"
+        $targetProcessors = Get-TargetProcessorCount -CpuPercent $Config.Resource.MaxCpuPercent
+        $resourceOptions = @(
+            "-XX:MaxRAMPercentage=$($Config.Resource.MaxMemoryPercent)",
+            "-XX:ActiveProcessorCount=$targetProcessors"
+        )
         if ([string]::IsNullOrWhiteSpace($previousJavaOptions)) {
-            $env:_JAVA_OPTIONS = $maxRamOption
-        }
-        elseif ($previousJavaOptions -match "MaxRAMPercentage") {
-            $env:_JAVA_OPTIONS = [regex]::Replace($previousJavaOptions, "-XX:MaxRAMPercentage=\S+", $maxRamOption)
+            $env:_JAVA_OPTIONS = ($resourceOptions -join ' ')
         }
         else {
-            $env:_JAVA_OPTIONS = "$previousJavaOptions $maxRamOption"
+            $updatedJavaOptions = $previousJavaOptions
+            if ($updatedJavaOptions -match "MaxRAMPercentage") {
+                $updatedJavaOptions = [regex]::Replace($updatedJavaOptions, "-XX:MaxRAMPercentage=\S+", $resourceOptions[0])
+            }
+            else {
+                $updatedJavaOptions = "$updatedJavaOptions $($resourceOptions[0])"
+            }
+
+            if ($updatedJavaOptions -match "ActiveProcessorCount") {
+                $updatedJavaOptions = [regex]::Replace($updatedJavaOptions, "-XX:ActiveProcessorCount=\S+", $resourceOptions[1])
+            }
+            else {
+                $updatedJavaOptions = "$updatedJavaOptions $($resourceOptions[1])"
+            }
+
+            $env:_JAVA_OPTIONS = $updatedJavaOptions
         }
 
-        Write-Log -Message "Applied JVM memory cap hint: $maxRamOption"
+        Write-Log -Message "Applied JVM caps: $($resourceOptions -join ' | ')"
     }
 
     try {
         $process = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -WindowStyle Hidden
-        Apply-ProcessResourceLimits -Process $process -Config $Config -Tag "IPED"
+        $jobHandle = Apply-ProcessResourceLimits -Process $process -Config $Config -Tag "IPED"
 
         $reportIntervalSeconds = [int]($Config.Progress.ReportIntervalMinutes * 60)
         $lastProgressReportAt = Get-Date
@@ -780,6 +940,10 @@ function Invoke-IPED {
         return $false
     }
     finally {
+        if ($jobHandle -ne [IntPtr]::Zero) {
+            [IPEDflowNative]::CloseHandle($jobHandle) | Out-Null
+        }
+
         $env:_JAVA_OPTIONS = $previousJavaOptions
     }
 }
@@ -915,7 +1079,9 @@ else {
     Write-Log -Message "Standalone progress report disabled (service/non-interactive session or config disabled)."
 }
 if ($config.Resource.EnableLimits) {
-    Write-Log -Message "Resource limits enabled: CPU=$($config.Resource.MaxCpuPercent)% | Memory/JVM=$($config.Resource.MaxMemoryPercent)% | Priority=$($config.Resource.PriorityClass)"
+    $startupCpuTarget = Get-TargetProcessorCount -CpuPercent $config.Resource.MaxCpuPercent
+    Write-Log -Message "Resource limits enabled: CPU=$($config.Resource.MaxCpuPercent)% -> $startupCpuTarget processor(s) visible | Memory/JVM=$($config.Resource.MaxMemoryPercent)% | Priority=$($config.Resource.PriorityClass)"
+    Write-Log -Message "GPU policy target: $($config.Resource.MaxGpuPercent)% (informational unless an external GPU-aware tool is added)."
 }
 else {
     Write-Log -Message "Resource limits disabled by configuration."

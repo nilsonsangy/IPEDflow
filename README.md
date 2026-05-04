@@ -51,6 +51,7 @@ Single configuration file: `IPEDflow.conf` 🔒
 
 - This file is ignored by Git
 - Create it by copying `IPEDflow.conf-example`
+- The status report `IPEDflow-report.html` is also local only and is not versioned
 
 Supported keys:
 
@@ -66,6 +67,7 @@ IPED_ADDITIONAL_ARGS=
 ENABLE_RESOURCE_LIMITS=true
 MAX_CPU_PERCENT=70
 MAX_MEMORY_PERCENT=70
+MAX_GPU_PERCENT=80
 PROCESS_PRIORITY_CLASS=BelowNormal
 DETECT_GPU=true
 ENABLE_STANDALONE_PROGRESS_REPORT=true
@@ -81,18 +83,24 @@ LOG_FILE=IPEDflow.log
 
 Resource control notes:
 
-- `MAX_CPU_PERCENT` limits CPU usage by applying processor affinity.
-- `MAX_MEMORY_PERCENT` applies a JVM cap hint (`-XX:MaxRAMPercentage`) for Java-based execution.
-- `PROCESS_PRIORITY_CLASS` can be `Idle`, `BelowNormal`, `Normal`, `AboveNormal`, `High`, or `RealTime`.
-- `DETECT_GPU=true` logs detected GPUs at startup.
-- `ENABLE_STANDALONE_PROGRESS_REPORT=true` prints periodic processing progress to console only in standalone mode.
-- `PROGRESS_REPORT_INTERVAL_MINUTES=60` controls how often standalone progress is printed.
+- `MAX_CPU_PERCENT` limits CPU usage in two layers: the launcher applies processor affinity to the IPED process, and it also sets `-XX:ActiveProcessorCount=<n>` so the JVM sizes its thread pools to the same CPU budget.
+- When resource limits are enabled, the launcher also sets `_JAVA_OPTIONS=-XX:MaxRAMPercentage=<value> -XX:ActiveProcessorCount=<n>` for the child JVM.
+
+How IPED is launched:
+
+- The script starts the executable configured in `IPED_EXECUTABLE_PATH` with `Start-Process`.
+- It passes these built-in arguments in this order: `-profile <profile> -d <image> -o <output> -log <processing.log>`.
+- If the case is being resumed, `--continue` is appended.
+- Any text in `IPED_ADDITIONAL_ARGS` is appended after the built-in arguments.
+- When resource limits are enabled, the launcher also sets `_JAVA_OPTIONS=-XX:MaxRAMPercentage=<value> -XX:ActiveProcessorCount=<n>` for the child JVM.
+- After launch, the script assigns the process to a Windows Job Object so the memory cap is enforced against the running process tree.
 
 GPU notes:
 
 - IPEDflow can detect GPUs (for example RTX cards) and log them.
 - IPED/Java processing is primarily CPU-based by default.
 - GPU acceleration depends on external tools/modules explicitly built for GPU usage.
+- If you need a real per-process GPU throttle, you will need an external GPU-aware wrapper or vendor-specific tooling.
 
 Atola-style case folders are supported. Example:
 
