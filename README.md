@@ -6,11 +6,11 @@
 
 Automated Windows monitor and service for forensic image acquisitions.
 
-IPEDflow watches extraction folders for completed disk images (`.E01`, `.E02`, ... or `.dd`) and triggers IPED processing automatically.
+IPEDflow watches extraction folders for completed disk images in multiple formats (EWF, raw segmented, raw single-file) and triggers IPED processing automatically.
 
-## ✨ Why IPEDflow
 
 - ✅ Hands-free monitoring of acquisition folders
+- ✅ **Multiple image formats**: EWF (`.E01`, `.E02`), raw segmented (`.001`, `.r00`, `.r01`, etc.), and single raw files (`.dd`, `.img`, `.raw`)
 - ✅ Automatic IPED processing after image stability checks
 - ✅ One case at a time to avoid overload
 - ✅ Persistent state to prevent duplicate processing
@@ -20,7 +20,10 @@ IPEDflow watches extraction folders for completed disk images (`.E01`, `.E02`, .
 
 A case is considered ready only when all checks pass:
 
-- File naming matches the configured EWF regex, or a `.dd` file is found
+- File naming matches configured patterns:
+	- **EWF**: `.E01`, `.E02`, `.E03`, etc. (via `SERIES_FILE_REGEX`)
+	- **Raw segmented**: `.001`, `.002`, `.r00`, `.r01`, etc. (via `RAW_FILE_REGEX`)
+	- **Raw single-file**: `.dd`, `.img`, `.raw` (via `RAW_FILE_EXTENSIONS`)
 - All segments have size greater than zero
 - No segment has been modified during the configured quiet period
 - The same fingerprint appears for the required number of stability checks
@@ -77,6 +80,8 @@ QUIET_PERIOD_SECONDS=600
 STABILITY_CHECKS_REQUIRED=3
 MAX_ITEMS_PER_CYCLE=1
 SERIES_FILE_REGEX=^(?<Stem>.+)\.E(?<Segment>\d{2,3})$
+RAW_FILE_REGEX=^(?<Stem>.+)\.(?:r\d{2,3}|\d{3,})$
+RAW_FILE_EXTENSIONS=.dd,.img,.raw
 STATE_FILE=IPEDflow-state.json
 LOG_FILE=IPEDflow.log
 ```

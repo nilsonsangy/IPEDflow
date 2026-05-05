@@ -387,6 +387,8 @@ function Load-Config {
         SERIES_FILE_REGEX = "^(?<Stem>.+)\\.E(?<Segment>\\d{2,3})$"
         STATE_FILE = "IPEDflow-state.json"
         LOG_FILE = "IPEDflow.log"
+            RAW_FILE_REGEX = "^(?<Stem>.+)\\.(?:r\\d{2,3}|\\d{3,})$"
+            RAW_FILE_EXTENSIONS = ".dd,.img,.raw"
     }
 
     $configSource = "defaults"
@@ -458,6 +460,18 @@ function Load-Config {
     }
 
     $stateFile = "IPEDflow-state.json"
+        $rawFileRegex = "^(?<Stem>.+)\\.(?:r(?<Segment>\\d{2,3})|(?<Segment>\\d{3,}))$"
+        if ($rawConfig.ContainsKey("RAW_FILE_REGEX")) {
+            $rawFileRegex = $rawConfig["RAW_FILE_REGEX"]
+        }
+
+        $rawFileExtensions = ".dd,.img,.raw"
+        if ($rawConfig.ContainsKey("RAW_FILE_EXTENSIONS")) {
+            $rawFileExtensions = $rawConfig["RAW_FILE_EXTENSIONS"]
+        }
+        $rawExtensionsList = @($rawFileExtensions -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() })
+
+        $stateFile = "IPEDflow-state.json"
     if ($rawConfig.ContainsKey("STATE_FILE")) {
         $stateFile = $rawConfig["STATE_FILE"]
     }
@@ -536,6 +550,8 @@ function Load-Config {
         MaxItemsPerCycle = $maxItemsPerCycle
         SeriesFileRegex = $seriesRegex
         StateFile = $stateFile
+            RawFileRegex = $rawFileRegex
+            RawFileExtensions = $rawExtensionsList
         LogFile = $logFile
         IPED = [pscustomobject]@{
             ExecutablePath = $IPEDExecutablePath
@@ -667,29 +683,70 @@ function Get-ExtractionCandidates {
             }
         }
 
-        foreach ($file in $files) {
-            if ($file.Extension -ine ".dd") {
-                continue
+        # Note: simple raw file handling is performed below using `RAW_FILE_EXTENSIONS`.
+            # Process raw segmented formats (.001, .r00, etc.)
+            $rawSeries = @{}
+            $rawRegex = [regex]$Config.RawFileRegex
+            foreach ($file in $files) {
+                $match = $rawRegex.Match($file.Name)
+                if (-not $match.Success) {
+                    continue
+                }
+
+                $stem = $match.Groups["Stem"].Value
+                $segment = [int]$match.Groups["Segment"].Value
+
+                if (-not $rawSeries.ContainsKey($stem)) {
+                    $rawSeries[$stem] = @()
+                }
+
+                $rawSeries[$stem] += [pscustomobject]@{
+                    Number = $segment
+                    Path = $file.FullName
+                    Length = [int64]$file.Length
+                    LastWriteTime = $file.LastWriteTime
+                }
             }
 
-            $candidates += [pscustomobject]@{
-                Key = "$($caseDir.FullName)|$($file.BaseName)|DD"
-                Root = $caseDir.Parent.FullName
-                CaseDir = $caseDir.FullName
-                CaseName = $caseDir.Name
-                Stem = $file.BaseName
-                Type = "DD"
-                Segments = @(
-                    [pscustomobject]@{
-                        Number = 1
-                        Path = $file.FullName
-                        Length = [int64]$file.Length
-                        LastWriteTime = $file.LastWriteTime
-                    }
-                )
-                ImagePath = $file.FullName
+            foreach ($stem in $rawSeries.Keys) {
+                $sorted = $rawSeries[$stem] | Sort-Object Number
+                $candidates += [pscustomobject]@{
+                    Key = "$($caseDir.FullName)|$stem|RAW"
+                    Root = $caseDir.Parent.FullName
+                    CaseDir = $caseDir.FullName
+                    CaseName = $caseDir.Name
+                    Stem = $stem
+                    Type = "RAW"
+                    Segments = $sorted
+                    ImagePath = $sorted[0].Path
+                }
             }
-        }
+
+            # Process simple raw file extensions (.dd, .img, .raw, etc.)
+            foreach ($file in $files) {
+                $extension = $file.Extension.ToLowerInvariant()
+                if ($Config.RawFileExtensions -notcontains $extension) {
+                    continue
+                }
+
+                $candidates += [pscustomobject]@{
+                    Key = "$($caseDir.FullName)|$($file.BaseName)|RAW-SIMPLE"
+                    Root = $caseDir.Parent.FullName
+                    CaseDir = $caseDir.FullName
+                    CaseName = $caseDir.Name
+                    Stem = $file.BaseName
+                    Type = "RAW"
+                    Segments = @(
+                        [pscustomobject]@{
+                            Number = 1
+                            Path = $file.FullName
+                            Length = [int64]$file.Length
+                            LastWriteTime = $file.LastWriteTime
+                        }
+                    )
+                    ImagePath = $file.FullName
+                }
+            }
     }
 
     return $candidates

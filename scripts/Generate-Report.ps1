@@ -14,8 +14,8 @@ function Generate-Report {
         $caseName = ($key -split '\|')[1]
         $status = 'Processed'
         $pct = 100
-        $dtIni = $proc.ContainsKey('StartedAt') ? $proc.StartedAt : ''
-        $dtEnd = $proc.ContainsKey('ProcessedAt') ? $proc.ProcessedAt : ''
+        if ($proc.ContainsKey('StartedAt')) { $dtIni = $proc.StartedAt } else { $dtIni = '' }
+        if ($proc.ContainsKey('ProcessedAt')) { $dtEnd = $proc.ProcessedAt } else { $dtEnd = '' }
         $rows += "<tr><td>$caseName</td><td>$status</td><td>$pct%</td><td>$dtIni</td><td>$dtEnd</td></tr>"
     }
 
@@ -24,7 +24,7 @@ function Generate-Report {
         $pend = $State.pending[$key]
         $caseName = ($key -split '\|')[1]
         $status = 'Processing'
-        $dtIni = $pend.ContainsKey('StartedAt') ? $pend.StartedAt : ''
+        if ($pend.ContainsKey('StartedAt')) { $dtIni = $pend.StartedAt } else { $dtIni = '' }
         $dtEnd = ''
         # Try to get % from log
         $paths = Get-IPEDPaths -Series ([pscustomobject]@{ CaseName = $caseName }) -Config $Config

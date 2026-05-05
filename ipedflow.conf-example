@@ -31,6 +31,13 @@ STABILITY_CHECKS_REQUIRED=3
 MAX_ITEMS_PER_CYCLE=1
 SERIES_FILE_REGEX=^(?<Stem>.+)\.E(?<Segment>\d{2,3})$
 
+# Raw/DD image file patterns and extensions.
+# For segmented raw formats (e.g., .001, .002 or .r00, .r01).
+# Supports Encase raw segments (.NNN), WinHex raw segments (.rNN), and similar formats.
+RAW_FILE_REGEX=^(?<Stem>.+)\.(?:r(?<Segment>\d{2,3})|(?<Segment>\d{3,}))$
+# For single-file raw images (comma-separated extensions, case-insensitive).
+RAW_FILE_EXTENSIONS=.dd,.img,.raw
+
 # Runtime persistence and logging files.
 STATE_FILE=IPEDflow-state.json
 LOG_FILE=IPEDflow.log
